@@ -1616,6 +1616,25 @@ The layer's descriptor model:
   while the PC call returns it through a hidden pointer in RDX. A generic sret/IDL thunk must special-case these
   two slots or the handle is garbage. This is a method-level ABI quirk; the heap object is still the public
   `ID3D12DescriptorHeap` interface.
+- **Console-addressed heaps (CL-02; implemented, not yet run on a GPU).** The retail title's slot 14 names the heap's
+  address and asserts that the CPU start handle equals it, so the title and `Create*View`/`CopyDescriptors` write the
+  heap's descriptors into the title's own memory. Before CL-02 a table VA inside such a heap reached the shader as
+  `heap_base + low32(address)`, an arena offset nobody had reserved. A shader-visible console heap now also owns an
+  arena range of the same size (its shadow); both start handles stay the title's address. A descriptor-table root
+  argument inside the heap is moved into the shadow when it reaches the list's user-data dwords
+  (`console_heap_shader_address`, after the bundle deferral, so once), and `ExecuteCommandLists` copies the title's
+  bytes into the shadow before it submits (`sync_console_descriptor_heaps`): slot by slot, only slots whose bytes
+  differ, skipping pages that are not committed and readable. A slot a batch in flight reads is one D3D12 forbids the
+  application to change, so it is never rewritten. Limits: a descriptor the title changes after `ExecuteCommandLists`
+  for that same batch is not seen (D3D12 allows it with volatile descriptors until the GPU runs the batch); a table
+  pointer the title builds in memory instead of passing as a root argument is not moved (0 such descriptor loads in
+  the corpus, section 3.4); and every `ExecuteCommandLists` compares the whole heap (no dirty tracking yet).
+  Two heaps of one device over one range are refused. Tests: `d3d12_console_descriptor_heap_test` (shadow and
+  translation, no GPU) and the "console-addressed heap" case of `d3d12_compute_test` (five exact reads).
+- **Buffer views the V# cannot address (CL-03; implemented, not yet run).** `CreateConstantBufferView` and the buffer
+  SRV/UAV paths leave the slot null and log once per kind when the view's VA or its end does not fit the V#'s 48-bit
+  base (`gfx10::buffer_base_encodable`), which is what an upload buffer below `heap_base` produces (D3D-53), instead
+  of a truncated address that faults the submission.
 - The bytes written for an image/sampler descriptor are **GFX10 T#/S# structures**, the same structures the
   translator reads. The layer writes them itself in `Create*View`; this does not depend on what the console driver
   wrote. If the game builds descriptors in memory itself, it must use the same format (the shader reads raw T#/S#),

@@ -73,11 +73,17 @@ def parse_blocks(spv):
     return blocks
 
 
-def find_guarded_texel_block(spv):
+def find_guarded_texel_block(spv, *, dynamic=False):
     """Verify every OpImageTexelPointer sits inside a basic block entered via an OpSelectionMerge
-    conditional branch whose condition is an OpLoad %bool %active, and return that block's instructions."""
+    conditional branch on the lane's active flag, and return that block's instructions.
+
+    The flag is an OpLoad %bool %active, or the constant %true when the shader never writes EXEC
+    (`exec_static_true`, #4473: %active starts true and nothing can clear it). dynamic=True accepts
+    only the OpLoad form, for a shader that writes EXEC."""
     blocks = parse_blocks(spv)
     active_loads = set(re.findall(r"^\s*(%\w+) = OpLoad %bool %active\b", spv, re.M))
+    if not dynamic:
+        active_loads.add("%true")
     guarded_targets = set()
     for insns in blocks.values():
         for i, ln in enumerate(insns):
@@ -175,6 +181,28 @@ class ImageAtomicsGuardTests(unittest.TestCase):
                     self.assertIn("OpAtomicLoad %uint ", spv)
                     self.assertIn("OpAtomicCompareExchange %uint ", spv)
                     self.assertIn("OpLoopMerge ", spv)
+
+    def test_exec_write_keeps_dynamic_guard(self):
+        # A shader that writes EXEC can turn lanes off, so the guard must load %active rather than
+        # fold to %true; without the write it may fold (exec_static_true).
+        body = [
+            "v_mov_b32_e32 v0, 5",
+            "v_mov_b32_e32 v1, 1",
+            "v_mov_b32_e32 v2, 2",
+            "image_atomic_add v0, v[1:2], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm glc",
+        ]
+        for op in ("image_atomic_add", "image_atomic_inc"):
+            with self.subTest(op=op):
+                lines = [ln.replace("image_atomic_add", op) for ln in body]
+                folded = translate(lines)
+                self.assertNotIn("OpLoad %bool %active", folded)
+                find_guarded_texel_block(folded)
+                spv = translate(["s_mov_b32 exec_lo, s0"] + lines)
+                validate_spirv(spv)
+                self.assertIn("OpStore %active ", spv)
+                find_guarded_texel_block(spv, dynamic=True)
+                with self.assertRaises(AssertionError):
+                    find_guarded_texel_block(folded, dynamic=True)
 
     def test_cmpswap_and_bad_data_width_rejected(self):
         # Valid 2-VGPR cmpswap (2D and 3D) stays guarded and valid.

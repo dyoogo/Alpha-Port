@@ -229,6 +229,29 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
                                        D3D12_GPU_VIRTUAL_ADDRESS console_address, std::uint64_t console_size,
                                        REFIID riid, void** out);
 
+// CL-02. A shader-visible console-addressed heap keeps the title's handles (CPU and GPU start = the title's address,
+// where the title and Create*View/CopyDescriptors write) and gets a shadow in the GPU address arena, which is what
+// shaders read. The two functions below are the only bridge between them:
+//   - console_heap_shader_address: a descriptor-table VA inside such a heap of `device` (the owner's identity, as a
+//     command list's attached_device()) becomes the same offset in the shadow; any other VA comes back unchanged.
+//     Called once per root argument, when the argument reaches the list's user-data dwords (never on a VA it already
+//     translated: a shadow VA can fall in a console heap's range).
+//   - sync_console_descriptor_heaps: copies every such heap of `device` from title memory into its shadow, slot by
+//     slot, writing only slots whose bytes changed and skipping pages that are not committed and readable. Called by
+//     ExecuteCommandLists before it submits, so a batch sees the descriptors as they were when it was executed
+//     (D3D12 lets the application change a descriptor only once the GPU no longer uses it).
+D3D12_GPU_VIRTUAL_ADDRESS console_heap_shader_address(IUnknown* device, D3D12_GPU_VIRTUAL_ADDRESS va);
+void sync_console_descriptor_heaps(IUnknown* device);
+
+// What the syncs did, for tests and the log: heaps registered now, bytes written into shadows, and the arena VA of
+// the shadow of `heap` (0 when it has none).
+struct ConsoleHeapStats {
+    std::uint64_t heaps = 0;
+    std::uint64_t bytes_copied = 0;
+};
+ConsoleHeapStats console_heap_stats();
+D3D12_GPU_VIRTUAL_ADDRESS console_heap_shadow_base(ID3D12DescriptorHeap* heap);
+
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
 // The VkBuffer behind a buffer created by such a device, or VK_NULL_HANDLE. For tests.

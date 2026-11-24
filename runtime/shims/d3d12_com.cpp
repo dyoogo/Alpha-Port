@@ -1240,6 +1240,9 @@ private:
             return;
         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
         if (!p) return;
+        // CL-02: a table inside a console-addressed heap is read from that heap's arena shadow. Translated here, past
+        // defer(), so a bundle's argument is translated once, when it plays on the parent list.
+        if (type == rt::rootsig::ParamType::Table) va = console_heap_shader_address(attached_device(), va);
         const std::uint32_t first = first_dword(state, *p);
         write(state, first, std::uint32_t(va));
         // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
@@ -1644,6 +1647,10 @@ public:
             recorded.push_back(&list->commands());
             graphics.push_back(list);
         }
+        // CL-02: console-addressed heaps are written in title memory; their arena shadows take the bytes as they are
+        // now, before this batch can reach the GPU (also when the queue holds it: the application may not change a
+        // descriptor the batch uses until the batch has run). A copy list reads no descriptors.
+        if (desc_.Type != D3D12_COMMAND_LIST_TYPE_COPY) sync_console_descriptor_heaps(attached_device());
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success)

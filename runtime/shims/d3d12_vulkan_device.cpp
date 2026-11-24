@@ -52,6 +52,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <type_traits>
 #include <cwchar>
@@ -1700,13 +1701,104 @@ const char* barrier_layout_refusal(const D3D12_RESOURCE_DESC& desc, D3D12_BARRIE
 // Console Xbox D3D12 CreateDescriptorHeap (device slot 14) passes the PC description followed by the heap address
 // and size, as measured in the retail boot (issue #313 comment 7107265058): a 16-byte PC D3D12_DESCRIPTOR_HEAP_DESC,
 // then address at +0x10 and size at +0x18. The title asserts GetCPUDescriptorHandleForHeapStart() == address.
-// Backing this range with title memory / section 3.3 aliasing is tracked separately; this path only satisfies the
-// observed ABI contract and must not be inferred from normal PC 16-byte CreateDescriptorHeap calls.
+// This path must not be inferred from normal PC 16-byte CreateDescriptorHeap calls.
 struct ConsoleDescriptorHeapDesc {
     D3D12_DESCRIPTOR_HEAP_DESC desc{};
     std::uint64_t address = 0;
     std::uint64_t size = 0;
 };
+
+// CL-02: the arena shadows of shader-visible console-addressed heaps (d3d12_com.h, console_heap_shader_address).
+// Before CL-02 such a heap had no backing the GPU could reach: the title wrote its descriptors at `address` (its own
+// memory), while a table VA inside the heap reached the shader as heap_base + low32(address), an arena offset nobody
+// had reserved (another resource's bytes, or past the arena's end). Now the heap owns an arena range (the shadow),
+// table VAs are moved into it when a root argument is recorded, and ExecuteCommandLists copies the title's bytes in.
+// Keyed by (owning device identity, console address); the ranges of one device never overlap (creation refuses it).
+struct ConsoleHeapShadow {
+    std::uint64_t bytes = 0;              // NumDescriptors * kDescriptorSize: the range a table VA may fall in
+    std::uint64_t shadow = 0;             // the shadow's arena VA (an arena offset, as every arena VA)
+    std::uint8_t* arena = nullptr;        // the shadow's host mapping: written, never read (it may be BAR memory)
+    const std::uint8_t* title = nullptr;  // the title's bytes, at the console address
+    std::uint64_t title_bytes = 0;        // how many of them sync reads: bytes, or the title's smaller size
+    // What the shadow holds, in system memory, so a sync compares against it instead of reading the arena back
+    // (uncached and over PCIe when the arena sits in a DEVICE_LOCAL | HOST_VISIBLE heap). Guarded by
+    // g_console_sync_mutex, like unreadable_logged.
+    std::unique_ptr<std::uint8_t[]> mirror;
+    bool unreadable_logged = false;
+};
+// Lookups (one per descriptor-table root argument, from every recording thread) take the map shared; creation and
+// release take it exclusive. Syncs take g_console_sync_mutex first (they write the shadows and the mirrors) and then
+// the map shared, so a heap cannot leave the map while a sync reads it. Neither lock is held while taking any other.
+std::shared_mutex g_console_heaps_mutex;
+std::mutex g_console_sync_mutex;
+using ConsoleHeapKey = std::pair<std::uintptr_t, std::uint64_t>;  // (owner identity as an integer, address)
+std::map<ConsoleHeapKey, ConsoleHeapShadow> g_console_heaps;
+std::atomic<std::uint64_t> g_console_heap_count{0};  // lets every other device skip the locks
+std::atomic<std::uint64_t> g_console_heap_bytes_copied{0};
+
+bool readable_region(const MEMORY_BASIC_INFORMATION& region) {
+    if (region.State != MEM_COMMIT || (region.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return false;
+    switch (region.Protect & 0xffu) {
+    case PAGE_READONLY:
+    case PAGE_READWRITE:
+    case PAGE_WRITECOPY:
+    case PAGE_EXECUTE_READ:
+    case PAGE_EXECUTE_READWRITE:
+    case PAGE_EXECUTE_WRITECOPY:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Title bytes -> shadow, one descriptor slot at a time, writing only slots that differ from the mirror: a slot a
+// batch still in flight reads is one the application may not change (D3D12), so it is never rewritten, not even with
+// equal bytes. A region that is not committed and readable (xmem commits on first touch; or the title decommitted it)
+// holds no descriptors: its shadow slots are null, so ones synced from it earlier are cleared rather than kept stale
+// (found in review, Codex event 24). Called with g_console_sync_mutex held and g_console_heaps_mutex held shared.
+void sync_console_heap(ConsoleHeapShadow& heap) {
+    static constexpr std::uint8_t kNullSlot[kDescriptorSize] = {};
+    const auto title = reinterpret_cast<std::uintptr_t>(heap.title);
+    std::uint64_t copied = 0;
+    for (std::uint64_t at = 0; at < heap.title_bytes;) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (!VirtualQuery(heap.title + at, &region, sizeof(region))) break;
+        const std::uintptr_t region_end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+        const std::uint64_t end = std::min<std::uint64_t>(heap.title_bytes, region_end - title);
+        if (end <= at) break;  // a region that ends before `at` cannot happen; stop rather than spin
+        if (readable_region(region)) {
+            for (std::uint64_t slot = at; slot < end;) {
+                const std::uint64_t n = std::min<std::uint64_t>(kDescriptorSize - slot % kDescriptorSize, end - slot);
+                if (std::memcmp(heap.mirror.get() + slot, heap.title + slot, std::size_t(n))) {
+                    std::memcpy(heap.mirror.get() + slot, heap.title + slot, std::size_t(n));
+                    std::memcpy(heap.arena + slot, heap.mirror.get() + slot, std::size_t(n));
+                    copied += n;
+                }
+                slot += n;
+            }
+        } else {
+            for (std::uint64_t slot = at; slot < end;) {
+                const std::uint64_t n = std::min<std::uint64_t>(kDescriptorSize - slot % kDescriptorSize, end - slot);
+                if (std::memcmp(heap.mirror.get() + slot, kNullSlot, std::size_t(n))) {
+                    std::memset(heap.mirror.get() + slot, 0, std::size_t(n));
+                    std::memset(heap.arena + slot, 0, std::size_t(n));
+                    copied += n;
+                }
+                slot += n;
+            }
+            if (!heap.unreadable_logged) {
+                heap.unreadable_logged = true;
+                std::fprintf(stderr,
+                             "[rt] d3d12: console descriptor heap at 0x%llx: bytes 0x%llx..0x%llx are not committed "
+                             "and readable; their shadow slots are null until they are (CL-02)\n",
+                             static_cast<unsigned long long>(title), static_cast<unsigned long long>(at),
+                             static_cast<unsigned long long>(end));
+            }
+        }
+        at = end;
+    }
+    if (copied) g_console_heap_bytes_copied.fetch_add(copied, std::memory_order_relaxed);
+}
 
 class DescriptorHeap final
     : public Child<DescriptorHeap, ID3D12DescriptorHeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
@@ -1726,11 +1818,25 @@ public:
           console_addressed_(console_address != 0) {
         const VkDeviceSize bytes = VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize;
         if (console_addressed_) {
-            // The retail boot checks GetCPUDescriptorHandleForHeapStart() == address. Report the requested title VA
-            // now; backing this range with title memory / §3.3 aliasing is tracked separately.
-            log_once("descriptor heap uses console address/size (not backed by title memory)", int(desc_.Type));
-            cpu_ = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(console_address_));
+            // The retail boot checks GetCPUDescriptorHandleForHeapStart() == address, so the CPU handles stay the
+            // title's: descriptors are written there. A shader-visible one also gets an arena shadow (CL-02), which
+            // register_console_shadow() publishes once the heap has its device.
             in_arena_ = false;
+            if ((desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
+                if (!device.arena_allocate(bytes, 256, arena_offset_, DeviceState::arena_descriptor_heap)) {
+                    log_once("GPU address arena full (raise LEONIDA_ARENA_MB); console descriptor heap size in KiB:",
+                             int(std::min<VkDeviceSize>(bytes / 1024, INT_MAX)));
+                    return;  // ok() false: E_OUTOFMEMORY, as for a normal shader-visible heap
+                }
+                shadow_ = true;
+                std::memset(device.arena.mapped + arena_offset_, 0, std::size_t(bytes));
+            } else if (desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
+                log_once("console descriptor heap without a GPU address arena: shaders cannot read it; type",
+                         int(desc_.Type));
+            }
+            if (console_size_ && console_size_ < bytes)
+                log_once("console descriptor heap smaller than NumDescriptors * 32; size", int(console_size_));
+            cpu_ = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(console_address_));
             return;
         }
         if ((desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
@@ -1749,11 +1855,54 @@ public:
     }
 
     ~DescriptorHeap() override {
-        if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize,
-                                            DeviceState::arena_descriptor_heap);
+        if (registered_) {
+            std::unique_lock lock(g_console_heaps_mutex);
+            g_console_heaps.erase(registered_key_);
+            g_console_heap_count.fetch_sub(1, std::memory_order_relaxed);
+        }
+        if (in_arena_ || shadow_)
+            device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize,
+                                  DeviceState::arena_descriptor_heap);
     }
 
     bool ok() const { return cpu_ != nullptr; }
+
+    // CL-02: publishes the shadow so table VAs inside [address, address + NumDescriptors * 32) are moved into it and
+    // ExecuteCommandLists fills it. `owner` is the identity command lists of this device carry (attached_device()).
+    // False when another heap of the device already covers part of the range: two heaps cannot answer for one VA.
+    bool register_console_shadow(IUnknown* owner) {
+        if (!shadow_) return true;
+        const std::uint64_t bytes = std::uint64_t(desc_.NumDescriptors) * kDescriptorSize;
+        if (console_address_ > UINT64_MAX - bytes) return false;
+        // The mirror starts as the shadow does: zeros. Made outside the lock.
+        std::unique_ptr<std::uint8_t[]> mirror(new std::uint8_t[std::size_t(bytes)]());
+        std::unique_lock lock(g_console_heaps_mutex);
+        const ConsoleHeapKey key{reinterpret_cast<std::uintptr_t>(owner), console_address_};
+        auto next = g_console_heaps.lower_bound(key);
+        if (next != g_console_heaps.end() && next->first.first == key.first &&
+            next->first.second < console_address_ + bytes)
+            return false;
+        if (next != g_console_heaps.begin()) {
+            const auto previous = std::prev(next);
+            if (previous->first.first == key.first && previous->first.second + previous->second.bytes > console_address_)
+                return false;
+        }
+        ConsoleHeapShadow entry;
+        entry.bytes = bytes;
+        entry.shadow = arena_offset_;
+        entry.arena = device_.arena.mapped + arena_offset_;
+        entry.title = cpu_;
+        entry.title_bytes = console_size_ ? std::min<std::uint64_t>(console_size_, bytes) : bytes;
+        entry.mirror = std::move(mirror);
+        g_console_heaps.emplace(key, std::move(entry));
+        g_console_heap_count.fetch_add(1, std::memory_order_relaxed);
+        registered_ = true;
+        registered_key_ = key;
+        return true;
+    }
+
+    // The arena VA shaders read for this heap's first descriptor: the shadow's for a console heap, 0 without one.
+    D3D12_GPU_VIRTUAL_ADDRESS shadow_base() const { return shadow_ ? UINT64(arena_offset_) : 0; }
 
     // A node mask of 0 reads back as the one node of a single adapter, as on the PC runtime (d3d12_node_mask_test).
     D3D12_DESCRIPTOR_HEAP_DESC STDMETHODCALLTYPE GetDesc() override {
@@ -1787,6 +1936,9 @@ private:
     std::uint64_t console_address_ = 0;
     std::uint64_t console_size_ = 0;
     bool console_addressed_ = false;
+    bool shadow_ = false;      // a console heap's arena range (CL-02); in_arena_ stays false: cpu_ is not in it
+    bool registered_ = false;  // in g_console_heaps under registered_key_
+    ConsoleHeapKey registered_key_{};
 };
 
 class Resource final
@@ -7173,6 +7325,14 @@ public:
             heap->Release();
             return E_OUTOFMEMORY;
         }
+        if (!heap->register_console_shadow(identity())) {
+            std::fprintf(stderr,
+                         "[rt] d3d12: console descriptor heap at 0x%llx overlaps a live one of the same device; "
+                         "refused (CL-02)\n",
+                         static_cast<unsigned long long>(address));
+            heap->Release();
+            return E_INVALIDARG;
+        }
         return hand_out(heap, riid, out);
     }
 
@@ -10058,8 +10218,39 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;
-
     return d->make_console_descriptor_heap(*desc, console_address, console_size, riid, out);
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS console_heap_shader_address(IUnknown* device, D3D12_GPU_VIRTUAL_ADDRESS va) {
+    if (!g_console_heap_count.load(std::memory_order_relaxed)) return va;
+    std::shared_lock lock(g_console_heaps_mutex);
+    // The last heap of `device` that starts at or below va, if va falls inside it.
+    auto it = g_console_heaps.upper_bound(ConsoleHeapKey{reinterpret_cast<std::uintptr_t>(device), va});
+    if (it == g_console_heaps.begin()) return va;
+    --it;
+    if (it->first.first != reinterpret_cast<std::uintptr_t>(device) || va - it->first.second >= it->second.bytes) return va;
+    return it->second.shadow + (va - it->first.second);
+}
+
+void sync_console_descriptor_heaps(IUnknown* device) {
+    if (!g_console_heap_count.load(std::memory_order_relaxed)) return;
+    std::lock_guard sync(g_console_sync_mutex);
+    std::shared_lock lock(g_console_heaps_mutex);
+    for (auto it = g_console_heaps.lower_bound(ConsoleHeapKey{reinterpret_cast<std::uintptr_t>(device), 0});
+         it != g_console_heaps.end() && it->first.first == reinterpret_cast<std::uintptr_t>(device); ++it)
+        sync_console_heap(it->second);
+}
+
+ConsoleHeapStats console_heap_stats() {
+    return {g_console_heap_count.load(std::memory_order_relaxed),
+            g_console_heap_bytes_copied.load(std::memory_order_relaxed)};
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS console_heap_shadow_base(ID3D12DescriptorHeap* heap) {
+    if (!heap) return 0;
+    if (ID3D12DescriptorHeap* real = rt::d3d12_xs::heap_proxy_real_heap(heap)) heap = real;
+    const DescriptorHeap* d = DescriptorHeap::from<DescriptorHeap>(heap);
+    return d ? d->shadow_base() : 0;
 }
 
 std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {

@@ -85,6 +85,21 @@ void log_once(const char* what, int value) {
     if (seen.insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
 }
 
+// CL-03: a buffer view whose console VA the V#'s 48-bit base cannot hold is left null, never truncated. The first
+// refusal of each kind names the VA and size; every refusal is counted, so a run shows how many views it lost.
+std::atomic<std::uint64_t> g_v_sharp_refusals{0};
+void log_v_sharp_refusal(const char* what, std::uint64_t va, std::uint64_t bytes) {
+    g_v_sharp_refusals.fetch_add(1, std::memory_order_relaxed);
+    static std::mutex mutex;
+    static std::set<std::string> seen;
+    std::lock_guard lock(mutex);
+    if (seen.insert(what).second)
+        std::fprintf(stderr,
+                     "[rt] d3d12: %s refused: VA 0x%llx + 0x%llx does not fit a V#'s 48-bit base (a buffer outside "
+                     "the arena below heap_base?); the slot stays null (CL-03)\n",
+                     what, static_cast<unsigned long long>(va), static_cast<unsigned long long>(bytes));
+}
+
 // Two test settings that make the standalone device look like a GPU with fewer Vulkan queues, so the path where D3D12
 // queues share a VkQueue runs on any GPU; both together give the Intel UHD 770 on Windows and lavapipe (one family,
 // one queue). LEONIDA_VK_MAX_QUEUES_PER_FAMILY=N (1 to 16): at most N VkQueues per queue family (unset, or not a
@@ -6388,6 +6403,18 @@ public:
         if (!destination.ptr) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         if (!desc || !desc->BufferLocation || !desc->SizeInBytes) return;
+        // D3D12 places constant buffers at 256-byte multiples (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT) and sizes
+        // them in 256-byte multiples; the PC runtime does not refuse either without its debug layer, so neither does
+        // this, but the hardware reads what the V# says, so say it once.
+        if ((desc->BufferLocation | desc->SizeInBytes) % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT)
+            log_once("constant-buffer view off D3D12's 256-byte placement (1) or size (2):",
+                     (desc->BufferLocation % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT ? 1 : 0) |
+                         (desc->SizeInBytes % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT ? 2 : 0));
+        // CL-03: a VA the V#'s 48-bit base cannot hold (an upload buffer below the arena) leaves a null view.
+        if (!leonida::gfx10::buffer_base_encodable(desc->BufferLocation, desc->SizeInBytes)) {
+            log_v_sharp_refusal("constant-buffer view", desc->BufferLocation, desc->SizeInBytes);
+            return;
+        }
         leonida::gfx10::Buffer buffer{};
         buffer.address = desc->BufferLocation;
         buffer.stride = 0;
@@ -6484,6 +6511,12 @@ public:
                                             : leonida::gfx10::select_one;
                 }
                 buffer.oob_select = leonida::gfx10::OobSelect::structured;
+            }
+            // CL-03: the bytes the view exposes, records * stride or the raw byte count.
+            const UINT64 view_bytes = buffer.stride ? UINT64(buffer.num_records) * buffer.stride : buffer.num_records;
+            if (!leonida::gfx10::buffer_base_encodable(buffer.address, view_bytes)) {
+                log_v_sharp_refusal("buffer shader-resource view", buffer.address, view_bytes);
+                return;
             }
             const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
             std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
@@ -6634,6 +6667,17 @@ public:
         const UINT64 va = resource->GetGPUVirtualAddress();
         const UINT64 counter_va = counter ? counter->GetGPUVirtualAddress() : 0;
         if (!va || (counter && !counter_va)) return;
+        // CL-03: both V#s (the view and its counter) must fit the 48-bit base; either one that does not leaves the slot
+        // null rather than a half-written view.
+        const UINT64 view_bytes = UINT64(view.NumElements) * unit;
+        if (!g::buffer_base_encodable(va + view.FirstElement * unit, view_bytes)) {
+            log_v_sharp_refusal("buffer unordered-access view", va + view.FirstElement * unit, view_bytes);
+            return;
+        }
+        if (counter && !g::buffer_base_encodable(counter_va + view.CounterOffsetInBytes, 4)) {
+            log_v_sharp_refusal("unordered-access view counter", counter_va + view.CounterOffsetInBytes, 4);
+            return;
+        }
         g::Buffer buffer{};
         buffer.address = va + view.FirstElement * unit;
         buffer.stride = structured || typed ? std::uint32_t(unit) : 0;

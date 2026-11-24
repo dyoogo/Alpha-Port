@@ -426,6 +426,25 @@ int main() {
     // And a V# in a 32-byte heap slot is not taken for an image.
     CHECK(!is_image(ImageWords{v[0], v[1], v[2], v[3], 0, 0, 0, 0}));
 
+    // CL-03: what the 48-bit base can hold. An upload buffer whose device address lies below heap_base gets a VA that
+    // wraps (device address - heap_base, mod 2^64; D3D-53 measured 0xffffffffffce0000 on a Radeon 880M): encode()
+    // keeps its low 48 bits, the shader zero-extends them and reads elsewhere, so the view must be refused instead.
+    constexpr std::uint64_t limit = std::uint64_t(1) << 48;
+    CHECK(kBufferBaseLimit == limit);
+    CHECK(buffer_base_encodable(0, 0) && buffer_base_encodable(0x1000, 256));
+    CHECK(buffer_base_encodable(limit - 256, 256));             // ends exactly at 2^48
+    CHECK(!buffer_base_encodable(limit - 256, 257));            // one byte past it
+    CHECK(!buffer_base_encodable(limit, 0));                    // first VA the field cannot hold
+    CHECK(!buffer_base_encodable(0xffffffffffce0000ull, 256));  // the measured wrapped upload-heap VA
+    CHECK(!buffer_base_encodable(0xffffffffffedc000ull, 256));  // the RTX 5070 Laptop's
+    CHECK(!buffer_base_encodable(0x1000, ~std::uint64_t(0)));   // a size that would wrap the end
+    {
+        // The defect itself: the wrapped VA encodes to a different address than the one asked for.
+        const Buffer wrapped{.address = 0xffffffffffce0000ull, .num_records = 256, .oob_select = OobSelect::raw};
+        const BufferWords w = encode(wrapped);
+        CHECK(((std::uint64_t(w[1] & 0xFFFF) << 32) | w[0]) != wrapped.address);
+    }
+
     std::printf("GFX10 descriptors: T#, S# and V# fields, round trips, %zu format rows and the Vulkan mappings OK\n",
                 std::size(format_table));
     return 0;

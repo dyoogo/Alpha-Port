@@ -672,6 +672,19 @@ struct Buffer {
     bool operator==(const Buffer&) const = default;
 };
 
+// BASE_ADDRESS holds 48 bits, which the translated shaders zero-extend before adding heap_base (tools/rdna2spirv.py,
+// buffer_address: word1 & 0xFFFF). A console VA at or above 2^48 cannot be stored: encode() would keep its low 48
+// bits and the shader would address a different, usually unmapped, location. Such a VA is what a buffer outside the
+// arena gets when its device address lies below heap_base (its VA, device address - heap_base, wraps; CL-03,
+// docs/d3d12_vulkan.md section 3.3, D3D-53). A view also exposes [address, address + bytes), whose end must not pass
+// 2^48 either: the shader's base + offset would wrap inside the 48-bit field's meaning. A caller that gets false must
+// not write the V# (leave the slot null) and say so; encode() itself never checks.
+constexpr std::uint64_t kBufferBaseLimit = std::uint64_t(1) << 48;
+
+constexpr bool buffer_base_encodable(std::uint64_t address, std::uint64_t bytes) noexcept {
+    return address < kBufferBaseLimit && bytes <= kBufferBaseLimit - address;
+}
+
 // As ac_build_buffer_descriptor fills it:
 //   WORD0  BASE_ADDRESS = address
 //   WORD1  BASE_ADDRESS_HI [15:0] = address >> 32, STRIDE [29:16]

@@ -1602,6 +1602,10 @@ static bool writable_range(const void* ptr, std::size_t bytes) {
 
 // Set by set_console_descriptor_heap_handler (BUILD-1); slot 14 reads it for an extended description.
 std::atomic<ConsoleDescriptorHeapHandler> g_console_descriptor_heap{nullptr};
+// Set by set_console_descriptor_heap_abi (BUILD-3): slot 14's callers pass the console's 32-byte description.
+std::atomic<bool> g_console_heap_abi{false};
+// Set by set_placed_at_va_pages_hook: commits xmem's first-touch pages (slots 133 and, BUILD-3, 14).
+std::atomic<PlacedAtVaPagesHook> g_placed_at_va_pages{nullptr};
 
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
@@ -1618,22 +1622,30 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
         (desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) == 0) {
         const auto* bytes = reinterpret_cast<const std::uint8_t*>(desc);
         const void* tail = bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC);
-        if (readable_range(tail, sizeof(std::uint64_t) * 2)) {
+        // Console-extended slot 14 (issue #313): address/size follow the PC desc. The proxy cannot see how large the
+        // caller's structure is: a PC caller's 16-byte desc is followed by whatever its frame holds, and the base
+        // took any non-zero word there for a console address (BUILD-2, reproduced: a stack address in
+        // device_proxy_test, an unrelated value in d3d12_compute_test). A plausibility check on those words is not
+        // enough either: garbage that happened to name writable memory became a heap there, and RTV writes through
+        // it corrupted the process heap (BUILD-3: d3d12_geometry, STATUS_HEAP_CORRUPTION in 3 of about 128 runs). So
+        // the words are read only when the process says its callers pass the console description
+        // (set_console_descriptor_heap_abi, which gta6rt sets for the title), and then must still describe a heap:
+        // a size covering NumDescriptors * 32 bytes, over memory the caller can write once xmem has committed it
+        // (the title writes the descriptors through the CPU handle, which is that address). Otherwise the call is the
+        // PC description it reads as, logged once.
+        if (g_console_heap_abi.load(std::memory_order_acquire) && readable_range(tail, sizeof(std::uint64_t) * 2)) {
             std::uint64_t address = 0;
             std::uint64_t size = 0;
             std::memcpy(&address, tail, sizeof(address));
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
-            // Console-extended slot 14 (issue #313): address/size follow the PC desc. The proxy cannot see how large
-            // the caller's structure is, and a PC caller's 16-byte desc is followed by whatever its frame holds: the
-            // base took any non-zero word there for a console address (BUILD-2, reproduced: a stack address in
-            // device_proxy_test, an unrelated value in d3d12_compute_test). So the two words are taken for a console
-            // heap only when they describe one: a size that covers NumDescriptors * 32 bytes, over memory the caller
-            // can write (it writes the descriptors through the CPU handle, which is that address). Otherwise the call
-            // is the PC description it reads as, logged once.
             const std::uint64_t needed = std::uint64_t(desc->NumDescriptors) * 32u;
-            const bool describes_heap = address != 0 && needed != 0 && size >= needed &&
-                                        writable_range(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)),
-                                                       static_cast<std::size_t>(needed));
+            const void* const heap_at = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address));
+            bool describes_heap = address != 0 && needed != 0 && size >= needed;
+            if (describes_heap) {
+                if (const PlacedAtVaPagesHook pages = g_placed_at_va_pages.load(std::memory_order_acquire))
+                    pages(heap_at, static_cast<std::size_t>(needed));  // a false return shows in the check below
+                describes_heap = writable_range(heap_at, static_cast<std::size_t>(needed));
+            }
             if (address != 0 && !describes_heap) {
                 static std::atomic<bool> logged{false};
                 if (!logged.exchange(true, std::memory_order_relaxed))
@@ -1804,7 +1816,6 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
 // device behind the proxy registered (set_placed_at_va_handler), with the PC flags kept and the layout made
 // ROW_MAJOR, as slot 76 does.
 std::atomic<PlacedAtVaHandler> g_placed_at_va{nullptr};
-std::atomic<PlacedAtVaPagesHook> g_placed_at_va_pages{nullptr};
 
 HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_RESOURCE_DESC* xbox_desc,
                                        std::uint32_t state, const IID* riid, void** out) {
@@ -2093,6 +2104,10 @@ void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook) {
 
 void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler) {
     g_console_descriptor_heap.store(handler, std::memory_order_release);
+}
+
+void set_console_descriptor_heap_abi(bool extended) {
+    g_console_heap_abi.store(extended, std::memory_order_release);
 }
 
 ID3D12Device* device_proxy_real_device(const void* device) {

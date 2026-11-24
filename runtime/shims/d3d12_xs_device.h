@@ -117,6 +117,14 @@ using ConsoleDescriptorHeapHandler = HRESULT (*)(ID3D12Device* real, const D3D12
                                                 std::uint64_t address, std::uint64_t size, REFIID riid, void** out);
 void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler);
 
+// Whether slot 14's callers pass the console's 32-byte description (BUILD-3). Off by default: a PC caller of the proxy
+// (the tests, any PC code) passes a 16-byte D3D12_DESCRIPTOR_HEAP_DESC, and the words after it are not its own, so the
+// proxy never reads them. gta6rt turns it on for the title, whose code (and the console middleware it loads) was
+// compiled against d3d12_xs.h. On, an extended description with a non-zero address is a console heap when its size
+// covers NumDescriptors * 32 bytes over memory the caller can write, after the pages hook (set_placed_at_va_pages_hook)
+// has committed it; otherwise it is created as a PC description and logged once.
+void set_console_descriptor_heap_abi(bool extended);
+
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
 // 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76. Slot 10 is intentionally false: the

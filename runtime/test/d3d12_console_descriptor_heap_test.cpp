@@ -150,8 +150,10 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
         std::uint64_t address = 0;
         std::uint64_t size = 0;
     } console{};
-    // The title passes memory it owns and writes (BUILD-2: the proxy now takes the extended words only when they
-    // describe such memory, so an unmapped made-up address is a PC description).
+    // The title passes memory it owns and writes (BUILD-2: the proxy takes the extended words only when they describe
+    // such memory, so an unmapped made-up address is a PC description). The proxy reads those words only when told its
+    // callers pass the console description (BUILD-3), as gta6rt does for the title; off again at the end.
+    rt::d3d12_xs::set_console_descriptor_heap_abi(true);
     void* const title = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!title) {
         std::fprintf(stderr, "VirtualAlloc failed\n");
@@ -198,6 +200,24 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
             const auto slot9 = reinterpret_cast<XboxHeapHandleFn>((*reinterpret_cast<void***>(raw))[9]);
             if (slot9(raw) == console.address) {
                 std::fprintf(stderr, "unmapped extended words were taken for a console heap\n");
+                ok = false;
+            }
+        }
+    }
+    // With the console description off (the default), the same extended words are not read at all: a PC heap.
+    rt::d3d12_xs::set_console_descriptor_heap_abi(false);
+    console.address = reinterpret_cast<std::uintptr_t>(title);
+    {
+        Ref<ID3D12DescriptorHeap> pc;
+        if (FAILED(proxy->CreateDescriptorHeap(&console.desc, IID_PPV_ARGS(pc.put()))) || !pc.get()) {
+            std::fprintf(stderr, "proxy CreateDescriptorHeap(PC ABI) failed\n");
+            ok = false;
+        } else {
+            using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);
+            void* const raw = pc.get();
+            const auto slot9 = reinterpret_cast<XboxHeapHandleFn>((*reinterpret_cast<void***>(raw))[9]);
+            if (slot9(raw) == console.address) {
+                std::fprintf(stderr, "extended words were read with the console description off\n");
                 ok = false;
             }
         }

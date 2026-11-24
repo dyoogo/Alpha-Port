@@ -1604,11 +1604,31 @@ class Gen:
         lane_masks.step(st, self.cur_ins)
         return st.get("vcc") in lane_masks.MASK_KINDS
 
+    # Scalar ALU ops whose 32-bit result is a number, never a lane mask in the per-lane representation
+    # (lane_masks.step treats their destination as data). Written to exec_lo / exec_hi, each lane takes its own bit.
+    EXEC_DATA_OPS = ("s_lshl_b32", "s_lshr_b32", "s_ashr_i32", "s_add_u32", "s_add_i32", "s_sub_u32", "s_sub_i32",
+                     "s_addc_u32", "s_subb_u32", "s_bfm_b32", "s_mul_i32", "s_mul_hi_u32", "s_mul_hi_i32",
+                     "s_bfe_u32", "s_bfe_i32", "s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32",
+                     "s_lshl4_add_u32", "s_brev_b32", "s_min_u32", "s_min_i32",
+                     "s_max_u32", "s_max_i32", "s_absdiff_i32", "s_abs_i32", "s_sext_i32_i8", "s_sext_i32_i16",
+                     "s_movk_i32", "s_addk_i32", "s_mulk_i32", "s_pack_ll_b32_b16", "s_pack_lh_b32_b16",
+                     "s_pack_hh_b32_b16")
+
+    def exec_write_is_data(self):
+        """Whether the instruction now writing a 32-bit half of EXEC computes a plain number (SHADER-1264) rather
+        than a lane mask. Copies, bitwise ops, saveexec and compares keep their existing mask handling."""
+        return self.cur_ins is not None and lane_masks.base_op(self.cur_ins["op"]) in self.EXEC_DATA_OPS
+
     def dst(self, a, val, *, eager=False):
         if a.get("sdwa_dst") and a["k"] == "vgpr":
             val = self.sdwa_dst(a, val)
         if a["k"] == "special" and a["t"] == "null":
             return                                    # result discarded
+        if a["k"] == "special" and a["t"] in ("exec_lo", "exec_hi") and (self.wave64 or a["t"] == "exec_lo") \
+                and self.exec_write_is_data():
+            # SHADER-1264: a computed number (s_lshl_b32 exec_lo, 1, s5) turns on the lanes whose bit is set.
+            self.exec_half_write(1 if a["t"] == "exec_hi" else 0, val, data=True)
+            return
         if self.wave64 and a["k"] == "special" and a["t"] in ("exec_lo", "exec_hi"):
             self.exec_half_write(1 if a["t"] == "exec_hi" else 0, val)
             return
@@ -5871,10 +5891,12 @@ class Gen:
         else:
             self.emit(f"{r} = OpLoad %uint %sg_lane")
 
-    def exec_half_write(self, half, val, const=None):
+    def exec_half_write(self, half, val, const=None, *, data=False):
         """Write one 32-bit half of EXEC. In the per-lane model a lane is active iff its bit is set. A constant
         sets each lane from its own bit; a register value (mask representation: all-ones / zero per lane) sets
-        the lanes of that half from their own copy. Lanes of the other half are unchanged."""
+        the lanes of that half from their own copy. data=True: `val` is a computed 32-bit number, the same in
+        every lane (a scalar ALU result, SHADER-1264), so each lane takes its own bit of it as with a constant.
+        Lanes of the other half are unchanged."""
         lane = self.wave_lane()
         rel, inh, bit, on, cur, new = (self.tmp() for _ in range(6))
         if half == 0:
@@ -5883,14 +5905,15 @@ class Gen:
         else:
             self.emit(f"{inh} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
             self.emit(f"{rel} = OpISub %uint {lane} {self.cu(32)}")
-        if const is not None:
+        if const is not None or data:
             r31 = self.tmp()
             self.emit(f"{r31} = OpBitwiseAnd %uint {rel} {self.cu(31)}")
             # Shift and mask, not OpBitFieldUExtract: Intel's Windows driver (UHD 770 / Xe-LP, 32.0.101.6129;
             # also seen on Xe-LPG) extracts from a constant that fits in 16 bits with the offset taken mod 16, so
             # exec_lo = 0xffff turned on all 32 lanes. GPU-checked with cs_exec_const.asm.
             shr = self.tmp()
-            self.emit(f"{shr} = OpShiftRightLogical %uint {self.cu(const & 0xFFFFFFFF)} {r31}")
+            word = self.cu(const & 0xFFFFFFFF) if const is not None else val
+            self.emit(f"{shr} = OpShiftRightLogical %uint {word} {r31}")
             self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
             self.emit(f"{on} = OpINotEqual %bool {bit} {self.cu(0)}")
         else:

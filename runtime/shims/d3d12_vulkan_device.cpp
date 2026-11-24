@@ -5008,6 +5008,8 @@ public:
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        // Slot 14 with a console address, by the same route (BUILD-1: the proxy no longer calls the layer directly).
+        rt::d3d12_xs::set_console_descriptor_heap_handler(&create_console_descriptor_heap);
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
@@ -7113,6 +7115,21 @@ public:
             case 10: return D3D12_RESOURCE_STATE_RESOLVE_DEST;
             default: return D3D12_RESOURCE_STATE_COMMON;
         }
+    }
+
+    // Xbox device slot 14 with a console address (create_console_descriptor_heap, after its argument checks). A member,
+    // as create_at_host_address is: the heap is built on this device's state and carries its identity, both private
+    // (BUILD-1: the base built it in the free function and did not compile, C2665 on state() const and C2248 on
+    // identity()).
+    HRESULT make_console_descriptor_heap(const D3D12_DESCRIPTOR_HEAP_DESC& desc, std::uint64_t address,
+                                         std::uint64_t size, REFIID riid, void** out) {
+        auto* heap = new DescriptorHeap(state_, desc, address, size);
+        heap->attach_device(identity());
+        if (!heap->ok()) {
+            heap->Release();
+            return E_OUTOFMEMORY;
+        }
+        return hand_out(heap, riid, out);
     }
 
     HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, std::uint32_t layout, REFIID riid,
@@ -9998,13 +10015,7 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;
 
-    auto* heap = new DescriptorHeap(d->state(), *desc, console_address, console_size);
-    heap->attach_device(d->identity());
-    if (!heap->ok()) {
-        heap->Release();
-        return E_OUTOFMEMORY;
-    }
-    return hand_out(heap, riid, out);
+    return d->make_console_descriptor_heap(*desc, console_address, console_size, riid, out);
 }
 
 std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {

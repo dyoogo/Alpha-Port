@@ -1579,6 +1579,30 @@ static bool readable_range(const void* ptr, std::size_t bytes) {
     return true;
 }
 
+// Committed memory the caller can write all of: the title writes a console heap's descriptors through its CPU handle,
+// which is the heap's address.
+static bool writable_range(const void* ptr, std::size_t bytes) {
+    if (!ptr || !bytes) return false;
+    const auto* p = static_cast<const std::uint8_t*>(ptr);
+    std::size_t remaining = bytes;
+    while (remaining) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) return false;
+        const DWORD protect = mbi.Protect & 0xffu;
+        if (protect != PAGE_READWRITE && protect != PAGE_EXECUTE_READWRITE) return false;
+        const auto base = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
+        const auto addr = reinterpret_cast<std::uintptr_t>(p);
+        const std::size_t avail = static_cast<std::size_t>(base + mbi.RegionSize - addr);
+        if (avail >= remaining) return true;
+        remaining -= avail;
+        p += avail;
+    }
+    return true;
+}
+
+// Set by set_console_descriptor_heap_handler (BUILD-1); slot 14 reads it for an extended description.
+std::atomic<ConsoleDescriptorHeapHandler> g_console_descriptor_heap{nullptr};
+
 HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_HEAP_DESC* desc, const IID* riid,
                                      void** out) {
     note_slot(14);
@@ -1599,13 +1623,39 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             std::uint64_t size = 0;
             std::memcpy(&address, tail, sizeof(address));
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
-            // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
-            // non-zero console VA is present; normal PC 16-byte descs never enter it.
-            if (address != 0) {
+            // Console-extended slot 14 (issue #313): address/size follow the PC desc. The proxy cannot see how large
+            // the caller's structure is, and a PC caller's 16-byte desc is followed by whatever its frame holds: the
+            // base took any non-zero word there for a console address (BUILD-2, reproduced: a stack address in
+            // device_proxy_test, an unrelated value in d3d12_compute_test). So the two words are taken for a console
+            // heap only when they describe one: a size that covers NumDescriptors * 32 bytes, over memory the caller
+            // can write (it writes the descriptors through the CPU handle, which is that address). Otherwise the call
+            // is the PC description it reads as, logged once.
+            const std::uint64_t needed = std::uint64_t(desc->NumDescriptors) * 32u;
+            const bool describes_heap = address != 0 && needed != 0 && size >= needed &&
+                                        writable_range(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)),
+                                                       static_cast<std::size_t>(needed));
+            if (address != 0 && !describes_heap) {
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true, std::memory_order_relaxed))
+                    std::fprintf(stderr, "[rt] d3d12_xs: slot 14: words after the description (0x%llx, 0x%llx) do not "
+                                         "describe a writable heap of %u descriptors; created as a PC description\n",
+                                 static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+                                 desc->NumDescriptors);
+            }
+            if (describes_heap) {
                 console_extended = true;
-                hr = rt::d3d12::create_console_descriptor_heap(
-                    self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
-                    __uuidof(ID3D12DescriptorHeap), &created);
+                const ConsoleDescriptorHeapHandler handler =
+                    g_console_descriptor_heap.load(std::memory_order_acquire);
+                if (handler) {
+                    hr = handler(self->real, desc, address, size, __uuidof(ID3D12DescriptorHeap), &created);
+                } else {
+                    static std::atomic<bool> logged{false};
+                    if (!logged.exchange(true, std::memory_order_relaxed))
+                        std::fprintf(stderr, "[rt] d3d12_xs: slot 14 console descriptor heap at 0x%llx: no handler "
+                                             "registered (E_NOTIMPL)\n",
+                                     static_cast<unsigned long long>(address));
+                    hr = E_NOTIMPL;
+                }
             }
         }
     }
@@ -2039,6 +2089,10 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler) {
 
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook) {
     g_placed_at_va_pages.store(hook, std::memory_order_release);
+}
+
+void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler) {
+    g_console_descriptor_heap.store(handler, std::memory_order_release);
 }
 
 ID3D12Device* device_proxy_real_device(const void* device) {

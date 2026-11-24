@@ -108,6 +108,15 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler);
 using PlacedAtVaPagesHook = bool (*)(const void* va, std::size_t bytes);
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook);
 
+// Device slot 14 with the console's extended description (the PC D3D12_DESCRIPTOR_HEAP_DESC, then the heap's address
+// at +0x10 and size at +0x18; issue #313) is answered by the device behind the proxy through this handler, which the
+// Vulkan layer registers (rt::d3d12::create_console_descriptor_heap), as slot 133 is. The proxy does not call the layer
+// directly: several targets build this file without it (root_sig_test, device_proxy_test, the PE-loader tests), and
+// the direct call left them unlinkable. With none registered an extended description answers E_NOTIMPL, logged once.
+using ConsoleDescriptorHeapHandler = HRESULT (*)(ID3D12Device* real, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+                                                std::uint64_t address, std::uint64_t size, REFIID riid, void** out);
+void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler);
+
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
 // 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76. Slot 10 is intentionally false: the

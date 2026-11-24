@@ -752,6 +752,125 @@ int main() {
             std::memcpy(cbv_oob_out.data(), src_bytes + 1 * bytes, bytes);
             std::memcpy(cbv_b_out.data(), src_bytes + 2 * bytes, bytes);
             std::memcpy(cbv_null_out.data(), src_bytes + 3 * bytes, bytes);
+
+            // CL-02: a console-addressed heap (Xbox device slot 14: the title names the heap's address) on memory the
+            // title owns. The title and Create*View / CopyDescriptors write there; before CL-02 a table inside the heap
+            // reached the shader as heap_base + low32(address), an arena offset nobody reserved, so these reads
+            // returned another range's bytes or faulted. Now the heap has an arena shadow, table VAs move into it and
+            // ExecuteCommandLists copies the title's bytes in. Every result below is compared word for word.
+            // Built with LEONIDA_CL02_BASELINE (test-only define), the case skips what needs the CL-02/CL-03 API and
+            // keeps the four GPU reads, so it compiles against the runtime before CL-02 and shows the old failure.
+            {
+                constexpr SIZE_T title_bytes = 64 * 1024;
+                void* const title = VirtualAlloc(nullptr, title_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                EXPECT(title != nullptr);
+                const auto title_va = static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(reinterpret_cast<std::uintptr_t>(title));
+                const D3D12_DESCRIPTOR_HEAP_DESC console_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+                                                              D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+                Ref<ID3D12DescriptorHeap> console_heap;
+                EXPECT(SUCCEEDED(rt::d3d12::create_console_descriptor_heap(device.p, &console_desc, title_va,
+                                                                           8 * inc, IID_PPV_ARGS(&console_heap.p))));
+                // The title's handles are untouched; the shader's address is the shadow, inside the arena, below 4 GiB.
+                EXPECT(console_heap->GetCPUDescriptorHandleForHeapStart().ptr == SIZE_T(title_va));
+                EXPECT(console_heap->GetGPUDescriptorHandleForHeapStart().ptr == title_va);
+#ifndef LEONIDA_CL02_BASELINE
+                const D3D12_GPU_VIRTUAL_ADDRESS shadow = rt::d3d12::console_heap_shadow_base(console_heap.p);
+                EXPECT(shadow >= 0x10000 && shadow + 8 * inc <= rt::d3d12::device_arena_size(device.p));
+                // A second heap over part of the same range has no single answer for a VA there: refused.
+                {
+                    Ref<ID3D12DescriptorHeap> overlapping;
+                    EXPECT(rt::d3d12::create_console_descriptor_heap(device.p, &console_desc, title_va + 4 * inc,
+                                                                     8 * inc, IID_PPV_ARGS(&overlapping.p)) ==
+                               E_INVALIDARG &&
+                           !overlapping.p);
+                }
+#endif
+                const auto console_cpu = [&](UINT idx) { return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(title_va + idx * inc)}; };
+                const auto console_gpu = [&](UINT idx) { return D3D12_GPU_DESCRIPTOR_HANDLE{title_va + idx * inc}; };
+                device->CreateConstantBufferView(&cbv_a, console_cpu(1));
+                device->CreateConstantBufferView(&cbv_b, console_cpu(2));
+
+                Ref<ID3D12Resource> console_readback;
+                const auto console_rb_desc = buffer_desc(6 * bytes, D3D12_RESOURCE_FLAG_NONE);
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &console_rb_desc,
+                                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                 IID_PPV_ARGS(&console_readback.p))));
+                Ref<ID3D12Fence> console_fence;
+                EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&console_fence.p))));
+                UINT64 console_value = 0;
+                // One batch per call: the descriptors the title changes between batches must reach the next one.
+                const auto read_through = [&](UINT slot_idx, UINT readback_offset) -> bool {
+                    if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.p, pso.p))) return false;
+                    ID3D12DescriptorHeap* console_heaps[] = {console_heap.p};
+                    list->SetDescriptorHeaps(1, console_heaps);
+                    list->SetComputeRootSignature(root.p);
+                    list->SetComputeRootUnorderedAccessView(1, va_a);
+                    const std::uint32_t rc[2] = {0, 0};  // s5 == 0: CBV V# mode, byte offset 0
+                    list->SetComputeRoot32BitConstants(0, 2, rc, 0);
+                    list->SetComputeRootDescriptorTable(2, console_gpu(slot_idx));
+                    list->Dispatch(1, 1, 1);
+                    const auto to_src =
+                        transition(out_a.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    list->ResourceBarrier(1, &to_src);
+                    list->CopyBufferRegion(console_readback.p, readback_offset, out_a.p, 0, bytes);
+                    const auto to_uav =
+                        transition(out_a.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    list->ResourceBarrier(1, &to_uav);
+                    if (list->Close() != S_OK) return false;
+                    queue->ExecuteCommandLists(1, lists);
+                    if (rt::d3d12::last_execute_result(queue.p) != leonida::ReplayResult::success) return false;
+                    ++console_value;
+                    return SUCCEEDED(queue->Signal(console_fence.p, console_value)) &&
+                           SUCCEEDED(console_fence->SetEventOnCompletion(console_value, nullptr));
+                };
+#ifndef LEONIDA_CL02_BASELINE
+                const std::uint64_t copied_before = rt::d3d12::console_heap_stats().bytes_copied;
+#endif
+                EXPECT(read_through(1, 0 * bytes));  // CBV A through the console heap
+                EXPECT(read_through(2, 1 * bytes));  // CBV B
+#ifndef LEONIDA_CL02_BASELINE
+                EXPECT(rt::d3d12::console_heap_stats().bytes_copied >= copied_before + 2 * 16);
+#endif
+                // Later changes reach the shadow too: CopyDescriptorsSimple from the arena heap's slot 2 (CBV B) into
+                // console slot 1, and a raw 32-byte write by the title itself (slot 1 of the arena heap, CBV A) into
+                // console slot 3. Neither goes through the layer's view creation.
+                device->CopyDescriptorsSimple(1, console_cpu(1), slot_cpu(2), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                std::memcpy(reinterpret_cast<void*>(console_cpu(3).ptr), reinterpret_cast<const void*>(slot_cpu(1).ptr),
+                            inc);
+                EXPECT(read_through(1, 2 * bytes));  // now CBV B
+                EXPECT(read_through(3, 3 * bytes));  // CBV A, written by the title
+#ifndef LEONIDA_CL02_BASELINE
+                // CL-03: a VA the V#'s 48-bit base cannot hold (an upload buffer below heap_base wraps to one like
+                // this, D3D-53) leaves the slot null instead of a truncated address: the read sees zeros, no fault.
+                std::memset(reinterpret_cast<void*>(console_cpu(4).ptr), 0x5A, inc);
+                const D3D12_CONSTANT_BUFFER_VIEW_DESC wrapped{0xffffffffffce0000ull, 256};
+                device->CreateConstantBufferView(&wrapped, console_cpu(4));
+                EXPECT(std::memcmp(reinterpret_cast<const void*>(console_cpu(4).ptr), zeros, sizeof(zeros)) == 0);
+                EXPECT(read_through(4, 4 * bytes));
+                // A page the title decommits holds no descriptors any more: the slot synced from it earlier must read
+                // as null, not as the CBV it held (Codex review, event 24). The heap is the region's first 256 bytes.
+                EXPECT(VirtualFree(title, 4096, MEM_DECOMMIT));
+                EXPECT(read_through(1, 5 * bytes));
+#endif
+
+                void* console_results = nullptr;
+                EXPECT(SUCCEEDED(console_readback->Map(0, nullptr, &console_results)));
+                const auto* words = static_cast<const std::uint32_t*>(console_results);
+                for (UINT i = 0; i < elements; ++i) {
+                    EXPECT(words[0 * elements + i] == 0x10000u + i);
+                    EXPECT(words[1 * elements + i] == 0x20000u + i);
+                    EXPECT(words[2 * elements + i] == 0x20000u + i);
+                    EXPECT(words[3 * elements + i] == 0x10000u + i);
+#ifndef LEONIDA_CL02_BASELINE
+                    EXPECT(words[4 * elements + i] == 0u);
+                    EXPECT(words[5 * elements + i] == 0u);
+#endif
+                }
+                console_readback->Unmap(0, nullptr);
+                console_heap.reset();
+                EXPECT(VirtualFree(title, 0, MEM_RELEASE));
+                std::printf("console-addressed heap: 6 reads through the arena shadow exact (CL-02, CL-03)\n");
+            }
         }
 
         // CreateShaderResourceView(buffer): raw, structured, and typed GFX10 V# descriptors in the shader-visible heap.

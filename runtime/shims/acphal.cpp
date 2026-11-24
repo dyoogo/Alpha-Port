@@ -141,7 +141,12 @@ struct SHAPE_XMA_CONTEXT {
     uint32_t reserved1 : 6;
     uint32_t loopStartOffset : 26;
     uint32_t loopEndOffset : 6;
-    uint32_t reserved[10];
+    // The bitfields above fill 5 dwords, not 6: the third unit holds 24 bits and currentByteOffset (26) cannot share
+    // it, so it opens the fourth. With reserved[10] the struct was 60 bytes and this file did not compile (C2338 on
+    // MSVC 19.44). The 64-byte stride is the measured fact (the retail executable's 350 contexts x 64 bytes, commit
+    // ccd36246f); the fields after the third unit are not measured, and nothing here reads them. So the padding
+    // makes up the size, and the field positions past the third dword stay unverified.
+    uint32_t reserved[11];
 };
 static_assert(sizeof(SHAPE_XMA_CONTEXT) == 64, "SHAPE_XMA_CONTEXT is 64 bytes per GDK");
 
@@ -162,7 +167,10 @@ struct SHAPE_PCM_CONTEXT {
     uint32_t reserved6 : 15;
     uint32_t format : 2;
     uint32_t reserved7 : 14;
-    uint32_t reserved[1];
+    // The bitfields above fill 6 dwords, so reserved[1] made 28 bytes, not the 32 asserted below (C2338 on MSVC
+    // 19.44). 32 is the size this file states for the GDK structure, not a measurement; nothing here reads the
+    // fields, only the array stride matters. The padding makes up the stated size.
+    uint32_t reserved[2];
 };
 static_assert(sizeof(SHAPE_PCM_CONTEXT) == 32, "SHAPE_PCM_CONTEXT is 32 bytes per GDK");
 

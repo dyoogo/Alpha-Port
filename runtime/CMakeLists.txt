@@ -745,6 +745,29 @@ if(BUILD_TESTING)
     target_compile_definitions(tiny_game_abort_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_game_abort_test PRIVATE /W4 /permissive- /utf-8)
     add_dependencies(tiny_game_abort_test gta6rt tiny_game)
+    # PE-G1..G4 and G7 (Shared/CLAUDE_PE_COVERAGE_REVIEW.md): exceptions across and inside mapped modules, a stack walk
+    # through mapped frames, and a delay-imported DLL. All three sit in the game folder, so under `gta6rt --run` the
+    # DLL is mapped by rt::Loader; its import library stays out of that folder, as tiny_bundled_dll's does.
+    add_library(tiny_eh_dll SHARED test/fixtures/tiny_eh_dll.cpp)
+    target_compile_definitions(tiny_eh_dll PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_eh_dll PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    set_target_properties(tiny_eh_dll PROPERTIES
+      OUTPUT_NAME tiny_eh_dll
+      PREFIX ""
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+      ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
+    )
+    add_executable(tiny_eh test/fixtures/tiny_eh.cpp)
+    target_compile_definitions(tiny_eh PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_eh PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    add_dependencies(tiny_eh tiny_eh_dll)
+    set_target_properties(tiny_eh PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>")
+    add_executable(tiny_delay test/fixtures/tiny_delay.cpp)
+    target_compile_definitions(tiny_delay PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_delay PRIVATE /W4 /permissive- /utf-8)
+    target_link_libraries(tiny_delay PRIVATE tiny_eh_dll delayimp)
+    target_link_options(tiny_delay PRIVATE /DELAYLOAD:tiny_eh_dll.dll)
+    set_target_properties(tiny_delay PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>")
     add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
 
     # Synthetic, hand-built images through Loader::load: range checks, wrapping RVAs, import-table termination and
@@ -1281,6 +1304,23 @@ if(BUILD_TESTING)
     add_test(NAME run_tiny_game_dir COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_game_dir.cmake")
+    # PE-G1..G4, G7: each mode natively first (the expected result, no loader involved), then under gta6rt --run. The
+    # cross and delay runs must also show rt::Loader mapping tiny_eh_dll.dll, so the host loader cannot stand in for it.
+    foreach(mode cross seh thread stackwalk)
+      add_test(NAME native_tiny_eh_${mode} COMMAND tiny_eh ${mode})
+      set(mapped "")
+      if(mode STREQUAL "cross")
+        set(mapped "tiny_eh_dll\\.dll mapped from game_dir")
+      endif()
+      add_test(NAME run_tiny_eh_${mode} COMMAND ${CMAKE_COMMAND}
+        "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_eh>" "-DARGS=${mode}" "-DPASS=tiny_eh: PASS"
+        "-DMAPPED=${mapped}" "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_mapped_guest.cmake")
+    endforeach()
+    add_test(NAME native_tiny_delay COMMAND tiny_delay)
+    add_test(NAME run_tiny_delay COMMAND ${CMAKE_COMMAND}
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_delay>" "-DPASS=tiny_delay: PASS"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_mapped_guest.cmake")
   endif()
   if(WIN32 AND TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)

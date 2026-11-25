@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cmath>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -708,6 +709,9 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearDepthStencilView");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr) return check(false);
+        // D3D12 rejects finite depth values outside [0, 1] at Close() time.
+        if ((flags & D3D12_CLEAR_FLAG_DEPTH) && std::isfinite(depth) && (depth < 0.0f || depth > 1.0f))
+            return check(false);
         check(list_.clear_depth_stencil(*reinterpret_cast<const leonida::TargetView*>(view.ptr), u(flags), depth,
                                         stencil, to_rects(count, rects)));
     }
@@ -835,18 +839,22 @@ public:
             return check(false);
         }
         // The record size is checked for every call: D3D12 rejects a signature whose stride cannot hold a record
-        // even when no command runs. The argument span is what the signature can walk, max_command_count * stride:
-        // the host refuses a range that ends past the buffer (`240` with stride `20` in a `256`-byte buffer), and
-        // it checks the offset itself when max_command_count is 0, where the required bytes are none.
+        // even when no command runs. The argument span is bounded by the last record that the hardware actually
+        // reads: (max_count - 1) * stride + record_size. The host does NOT reject the last record's stride
+        // padding running past the buffer end, nor does it reject an offset past the buffer when max=0 (a no-op).
         const UINT64 record_size =
             kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
             : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
             : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
             : 0;
         if (!record_size || stride < record_size || stride % 4 != 0) return check(false);
-        if (argument_buffer_offset > arg_desc.Width ||
-            UINT64(max_command_count) > (arg_desc.Width - argument_buffer_offset) / stride)
-            return check(false);
+        if (max_command_count > 0) {
+            // The last record must fit entirely: offset + (max-1)*stride + record_size <= width.
+            // Guard against 64-bit overflow in the multiplication.
+            const UINT64 tail = UINT64(max_command_count - 1) * stride + record_size;
+            if (argument_buffer_offset > arg_desc.Width || tail > arg_desc.Width - argument_buffer_offset)
+                return check(false);
+        }
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;
         cmd.stride = stride;

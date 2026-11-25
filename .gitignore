@@ -1,0 +1,174 @@
+# ==========================================
+# ALPHA PORT GTA VI - ALPHA STUDIO
+# ==========================================
+
+# Proprietary game files
+*.exe
+*.dll
+*.xex
+*.xvc
+*.rpf
+*.ttpf
+*.awc
+*.xma
+*.xvd
+*.xvc
+*.torrent
+MicrosoftGame.Config
+
+# Game packages and local assets
+/game-files/
+/game-data/
+/GameFiles/
+/GameData/
+/early_xmas/
+/GTA6/
+/GTA_VI/
+/extracted/
+/generated-assets/
+/retail/
+/packages/
+
+# Generated shaders
+*.spv
+*.dxbc
+*.dxil
+*.fssm
+*.xbch
+*.shadercache
+pipeline_cache.bin
+
+# Generated models and textures
+*.dds
+*.fbx
+*.obj
+*.gltf
+*.glb
+*.ktx
+*.ktx2
+
+# Build outputs
+build/
+builds/
+Builds/
+out/
+dist/
+target/
+bin/
+obj/
+Debug/
+Release/
+x64/
+x86/
+artifacts/
+work/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+cmake_install.cmake
+CTestTestfile.cmake
+CMakeUserPresets.json
+Testing/
+compile_commands.json
+
+# C / C++
+*.o
+*.a
+*.lib
+*.so
+*.dylib
+*.pdb
+*.ilk
+*.exp
+*.pch
+*.idb
+*.tlog
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Node.js
+node_modules/
+.npm/
+.next/
+.vite/
+npm-debug.log*
+yarn-error.log*
+
+# Visual Studio and editors
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.idea/
+
+# Local AI agent settings
+.claude/settings.local.json
+.codex/auth.json
+.codex/sessions/
+.codex/log/
+AgentBridge/database/
+AgentBridge/logs/
+
+# Local databases and coordination
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.lockfile
+
+# Diagnostics and GPU captures
+*.log
+*.dmp
+*.mdmp
+*.rdc
+*.rgp
+*.rgd
+*.rmv
+*.pix3
+crash_dumps/
+diagnostics/captures/
+
+# Local paths and configuration
+game_path.txt
+shader_path.txt
+local_config.json
+local_settings.json
+
+# Credentials and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials/
+auth.json
+
+# Archives and backups
+*.zip
+*.7z
+*.rar
+*.bak
+*.tmp
+
+# Operating systems
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/

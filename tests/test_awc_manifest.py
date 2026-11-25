@@ -355,29 +355,43 @@ class ManifestTest(unittest.TestCase):
             self.assertEqual(f.read(), '{"previous": true}\n')
         self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])   # no temporary file left
 
-    @unittest.skipIf(os.name == "nt", "Windows does not enforce POSIX 0o444 on regular files")
-    def test_failed_replace_of_read_only_manifest_removes_writable_temp(self):
-        out = os.path.join(self.tmp.name, "manifest.json")
-        previous = '{"previous": true}\n'
-        with open(out, "w", encoding="utf-8") as f:
-            f.write(previous)
-        os.chmod(out, 0o444)
-        self.addCleanup(lambda: os.path.exists(out) and os.chmod(out, 0o600))
-        made_writable = []
-        real_chmod = os.chmod
+    def test_read_only_manifest_is_preserved(self):
+        out = Path(self.tmp.name, "manifest.json")
+        previous = b'{"previous": true}\n'
+        out.write_bytes(previous)
+        out.chmod(0o444)
+        self.addCleanup(out.chmod, 0o600)
+        mode = out.stat().st_mode
 
-        def chmod(path, mode, *args, **kwargs):
-            if isinstance(path, str) and os.path.basename(path).startswith(".awc_manifest-") and mode == 0o600:
-                made_writable.append(path)
-            return real_chmod(path, mode, *args, **kwargs)
+        with self.assertRaises(PermissionError):
+            awc_manifest.write_manifest([], 0, 0, "json", out)
 
-        with mock.patch.object(awc_manifest, "replace_retry", side_effect=OSError("replace denied")), \
-                mock.patch.object(awc_manifest.os, "chmod", chmod):
-            with self.assertRaises(OSError):
+        self.assertEqual(out.read_bytes(), previous)
+        self.assertEqual(out.stat().st_mode, mode)
+        self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])
+
+    def test_failed_replace_removes_read_only_staging_file(self):
+        out = Path(self.tmp.name, "manifest.json")
+        previous = b'{"previous": true}\n'
+        out.write_bytes(previous)
+
+        def fail_replace(staged, destination):
+            self.assertEqual(Path(destination), out)
+            os.chmod(staged, 0o444)
+            raise PermissionError("replace denied")
+
+        real_unlink = os.unlink
+
+        def unlink_staging(path):
+            self.assertTrue(os.stat(path).st_mode & 0o200)
+            real_unlink(path)
+
+        with mock.patch.object(awc_manifest, "replace_retry", side_effect=fail_replace), \
+                mock.patch.object(awc_manifest.os, "unlink", side_effect=unlink_staging) as unlink:
+            with self.assertRaisesRegex(PermissionError, "replace denied"):
                 awc_manifest.write_manifest([], 0, 0, "json", out)
-        self.assertEqual(len(made_writable), 1)
-        with open(out, encoding="utf-8") as f:
-            self.assertEqual(f.read(), previous)
+        unlink.assert_called_once()
+        self.assertEqual(out.read_bytes(), previous)
         self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])
 
     def test_recursive_report_distinguishes_banks_with_the_same_basename(self):

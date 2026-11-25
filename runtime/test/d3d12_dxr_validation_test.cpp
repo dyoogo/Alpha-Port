@@ -101,55 +101,15 @@ int run_suite(ID3D12Device* base_dev, const char* name, bool check_strict_valida
                      D3D12_RESOURCE_STATE_GENERIC_READ, inst_buf) ||
         !make_buffer(dev.p, 262144, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                      D3D12_RESOURCE_STATE_COMMON, scratch) ||
-        !make_buffer(dev.p, 262144, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                     D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, blas_buf) ||
-        !make_buffer(dev.p, 262144, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                     D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, tlas_buf) ||
-        !make_buffer(dev.p, 262144, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                     D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, src_as) ||
         !make_buffer(dev.p, 4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                      D3D12_RESOURCE_STATE_COMMON, post_buf)) {
         std::fprintf(stderr, "%s: failed to allocate synthetic buffers\n", name);
-        // When the Vulkan device lacks VK_KHR_acceleration_structure (e.g. RDNA 1), the layer
-        // reports XDXR-based raytracing but cannot create buffers with
-        // D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE as their initial state.
-        // Skip rather than fail: the validation logic itself is not broken, the resource
-        // allocation simply cannot proceed without hardware acceleration structures.
-        if (check_strict_validation) {
-            std::printf("%s: skipping (acceleration-structure buffers not allocatable)\n", name);
-            return 77;
-        }
         return 1;
-    }
-
-    // Upload a single valid triangle and a single valid TLAS instance.
-    {
-        float* verts = nullptr;
-        D3D12_RANGE no_read{0, 0};
-        if (FAILED(vb->Map(0, &no_read, reinterpret_cast<void**>(&verts))) || !verts) return 1;
-        const float tri_verts[9] = {0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
-        std::memcpy(verts, tri_verts, sizeof(tri_verts));
-        D3D12_RANGE written{0, sizeof(tri_verts)};
-        vb->Unmap(0, &written);
-
-        D3D12_RAYTRACING_INSTANCE_DESC* inst = nullptr;
-        if (FAILED(inst_buf->Map(0, &no_read, reinterpret_cast<void**>(&inst))) || !inst) return 1;
-        std::memset(inst, 0, sizeof(*inst));
-        inst->Transform[0][0] = 1.0f;
-        inst->Transform[1][1] = 1.0f;
-        inst->Transform[2][2] = 1.0f;
-        inst->InstanceMask = 0xFF;
-        inst->AccelerationStructure = blas_buf->GetGPUVirtualAddress();
-        D3D12_RANGE inst_written{0, sizeof(*inst)};
-        inst_buf->Unmap(0, &inst_written);
     }
 
     const D3D12_GPU_VIRTUAL_ADDRESS vb_va = vb->GetGPUVirtualAddress();
     const D3D12_GPU_VIRTUAL_ADDRESS inst_va = inst_buf->GetGPUVirtualAddress();
     const D3D12_GPU_VIRTUAL_ADDRESS scr_va = scratch->GetGPUVirtualAddress();
-    const D3D12_GPU_VIRTUAL_ADDRESS blas_va = blas_buf->GetGPUVirtualAddress();
-    const D3D12_GPU_VIRTUAL_ADDRESS tlas_va = tlas_buf->GetGPUVirtualAddress();
-    const D3D12_GPU_VIRTUAL_ADDRESS src_va = src_as->GetGPUVirtualAddress();
     const D3D12_GPU_VIRTUAL_ADDRESS post_va = post_buf->GetGPUVirtualAddress();
 
     D3D12_RAYTRACING_GEOMETRY_DESC tri{};
@@ -210,6 +170,41 @@ int run_suite(ID3D12Device* base_dev, const char* name, bool check_strict_valida
             std::fprintf(stderr, "%s: valid TLAS ARRAY_OF_POINTERS prebuild returned zero\n", name);
             return 1;
         }
+    }
+
+    if (!make_buffer(dev.p, 262144, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                     D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, blas_buf) ||
+        !make_buffer(dev.p, 262144, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                     D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, tlas_buf) ||
+        !make_buffer(dev.p, 262144, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                     D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, src_as)) {
+        std::fprintf(stderr, "%s: failed to allocate acceleration structures\n", name);
+        return 1;
+    }
+    const D3D12_GPU_VIRTUAL_ADDRESS blas_va = blas_buf->GetGPUVirtualAddress();
+    const D3D12_GPU_VIRTUAL_ADDRESS tlas_va = tlas_buf->GetGPUVirtualAddress();
+    const D3D12_GPU_VIRTUAL_ADDRESS src_va = src_as->GetGPUVirtualAddress();
+
+    // Upload a single valid triangle and a single valid TLAS instance.
+    {
+        float* verts = nullptr;
+        D3D12_RANGE no_read{0, 0};
+        if (FAILED(vb->Map(0, &no_read, reinterpret_cast<void**>(&verts))) || !verts) return 1;
+        const float tri_verts[9] = {0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
+        std::memcpy(verts, tri_verts, sizeof(tri_verts));
+        D3D12_RANGE written{0, sizeof(tri_verts)};
+        vb->Unmap(0, &written);
+
+        D3D12_RAYTRACING_INSTANCE_DESC* inst = nullptr;
+        if (FAILED(inst_buf->Map(0, &no_read, reinterpret_cast<void**>(&inst))) || !inst) return 1;
+        std::memset(inst, 0, sizeof(*inst));
+        inst->Transform[0][0] = 1.0f;
+        inst->Transform[1][1] = 1.0f;
+        inst->Transform[2][2] = 1.0f;
+        inst->InstanceMask = 0xFF;
+        inst->AccelerationStructure = blas_buf->GetGPUVirtualAddress();
+        D3D12_RANGE inst_written{0, sizeof(*inst)};
+        inst_buf->Unmap(0, &inst_written);
     }
 
     // 2. Valid GPU BLAS + TLAS build sanity check (executed on queue, zero Vulkan validation errors).

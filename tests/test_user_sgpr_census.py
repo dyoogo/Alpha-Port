@@ -120,21 +120,17 @@ def test_json_report_refuses_to_overwrite_index(tmp_path, capsys, output_kind):
     elif output_kind == "folding-volume-case":
         output = tmp_path / "INDEX.JSON"
 
-    probe = mock.Mock(return_value=True)
-    ctx = (mock.patch.multiple(report_paths, path_key=mock.Mock(side_effect=str),
-                               _resolved_key=mock.Mock(side_effect=str),
-                               same_name_on_folding_volume=probe)
-           if output_kind == "folding-volume-case" else contextlib.nullcontext())
-    with ctx, (mock.patch.object(os.path, "samefile", side_effect=OSError("not same"))
-               if output_kind == "folding-volume-case" else contextlib.nullcontext()):
+    with contextlib.ExitStack() as ctx:
+        if output_kind == "folding-volume-case":
+            # Simulate a mount that preserves case in resolved paths and folds names on lookup.
+            ctx.enter_context(mock.patch.object(os.path, "realpath", side_effect=os.fspath))
+            ctx.enter_context(mock.patch.object(report_paths, "_resolved_key", side_effect=str))
+            ctx.enter_context(mock.patch.object(os.path, "samefile", side_effect=OSError("not same")))
+            probe = ctx.enter_context(mock.patch.object(report_paths, "_same_resolved_name", return_value=True))
         with pytest.raises(SystemExit) as exc:
             usc.main([str(index), "--json", str(output)])
-    if output_kind == "folding-volume-case" and os.name != "nt":
-        # On Windows, os.path.realpath resolves both case spellings to the same
-        # canonical path, so _resolved_key detects the collision before the
-        # volume probe is reached.  The test still verifies the overwrite is
-        # refused (SystemExit with code 2 and the error message below).
-        probe.assert_called_once()
+        if output_kind == "folding-volume-case":
+            probe.assert_called_once_with(str(index), str(output))
 
     assert exc.value.code == 2
     assert "--json must not overwrite the input index" in capsys.readouterr().err

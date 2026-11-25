@@ -225,18 +225,18 @@ class TestCli(unittest.TestCase):
                 f.write("prop_crate_01\n")
 
             folded_names = os.path.join(tmp, "NAMES.TXT")
-            with (mock.patch.object(report_paths, "path_key", side_effect=str),
+            def folding_probe(first, second):
+                return first.casefold() == second.casefold()
+
+            with (mock.patch.object(os.path, "realpath", side_effect=os.fspath),
                   mock.patch.object(report_paths, "_resolved_key", side_effect=str),
-                  mock.patch.object(report_paths.os.path, "samefile", side_effect=OSError("not same")),
-                  mock.patch.object(report_paths, "same_name_on_folding_volume", return_value=True) as probe,
+                  mock.patch.object(os.path, "samefile", side_effect=OSError("not same")),
+                  mock.patch.object(report_paths, "_same_resolved_name", side_effect=folding_probe) as probe,
                   mock.patch.object(sys, "argv", ["psin_names.py", src, "--names", names, "--refs", folded_names])):
                 with self.assertRaises(SystemExit) as cm:
                     N.main()
                 self.assertEqual(cm.exception.code, 2)
-            if os.name != "nt":
-                # On Windows, realpath resolves both case spellings identically,
-                # so the collision is caught by _resolved_key before the probe.
-                self.assertGreaterEqual(probe.call_count, 1)
+            probe.assert_any_call(names, folded_names)
 
             index_link = os.path.join(tmp, "index_alias.tsv")
             try:

@@ -63,7 +63,7 @@ from spirv_wave_interp import UnsupportedConstruct, run_wave  # noqa: E402
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 DATA = (1, 2, 3, 8, 9)            # VGPRs the bodies compute on (v0 = lane id is kept intact)
 SREGS = (10, 11, 12, 13)          # uniform SGPRs the bodies compute on
-CCS = ("eq", "ne", "lt", "le", "gt", "ge")
+CCS = ("eq", "lg", "lt", "le", "gt", "ge")
 VOP3 = ("v_mul_lo_u32", "v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32")
 
 

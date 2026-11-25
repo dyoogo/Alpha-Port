@@ -122,13 +122,18 @@ def test_json_report_refuses_to_overwrite_index(tmp_path, capsys, output_kind):
 
     probe = mock.Mock(return_value=True)
     ctx = (mock.patch.multiple(report_paths, path_key=mock.Mock(side_effect=str),
+                               _resolved_key=mock.Mock(side_effect=str),
                                same_name_on_folding_volume=probe)
            if output_kind == "folding-volume-case" else contextlib.nullcontext())
     with ctx, (mock.patch.object(os.path, "samefile", side_effect=OSError("not same"))
                if output_kind == "folding-volume-case" else contextlib.nullcontext()):
         with pytest.raises(SystemExit) as exc:
             usc.main([str(index), "--json", str(output)])
-    if output_kind == "folding-volume-case":
+    if output_kind == "folding-volume-case" and os.name != "nt":
+        # On Windows, os.path.realpath resolves both case spellings to the same
+        # canonical path, so _resolved_key detects the collision before the
+        # volume probe is reached.  The test still verifies the overwrite is
+        # refused (SystemExit with code 2 and the error message below).
         probe.assert_called_once()
 
     assert exc.value.code == 2

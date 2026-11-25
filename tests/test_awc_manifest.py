@@ -355,6 +355,7 @@ class ManifestTest(unittest.TestCase):
             self.assertEqual(f.read(), '{"previous": true}\n')
         self.assertEqual(os.listdir(self.tmp.name), ["manifest.json"])   # no temporary file left
 
+    @unittest.skipIf(os.name == "nt", "Windows does not enforce POSIX 0o444 on regular files")
     def test_failed_replace_of_read_only_manifest_removes_writable_temp(self):
         out = os.path.join(self.tmp.name, "manifest.json")
         previous = '{"previous": true}\n'

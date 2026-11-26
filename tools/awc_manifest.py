@@ -25,8 +25,10 @@ Usage: `python -I tools/awc_manifest.py --help` lists the options.
 """
 import argparse
 import csv
+import errno
 import json
 import os
+import stat
 import struct
 import sys
 import tempfile
@@ -221,7 +223,11 @@ def write_manifest(rows: list, banks: int, streamed: int, fmt: str, out: str) ->
             _emit(f)
         return
     if mode is not None:
-        # Retain the direct writer's permission check without truncating the report.
+        # A POSIX rename checks the parent directory. Honor a read-only report even
+        # when a privileged process could open or replace it.
+        if stat.S_ISREG(mode) and not mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH):
+            raise PermissionError(errno.EACCES, "read-only manifest", destination)
+        # Check the caller's actual access as well, without truncating the report.
         os.close(os.open(destination, os.O_WRONLY))
 
     staged = tempfile.NamedTemporaryFile(
@@ -235,8 +241,7 @@ def write_manifest(rows: list, banks: int, streamed: int, fmt: str, out: str) ->
             os.chmod(staged.name, published_mode(destination))
         replace_retry(staged.name, destination)
     finally:
-        # The staging file may have inherited a read-only destination's mode; make it deletable
-        # first, or Windows strands it beside the manifest when the replace fails.
+        # Windows cannot unlink a read-only staging file after a failed replacement.
         try:
             os.chmod(staged.name, 0o600)
         except OSError:

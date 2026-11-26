@@ -233,8 +233,8 @@ std::vector<Case> parity_cases() {
         {"arg_buf width=3 (max=1 OOB)", false,
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf3.p, 0, nullptr, 0); }},
 
-        // Padded stride: the host bounds max_count * stride, not (max_count - 1) * stride + record_size, so a
-        // record that fits at the end of the buffer while its stride runs past it is refused
+        // WARP and native RX 5500 XT accept a final record ending at the buffer boundary even when its
+        // trailing stride padding extends past the end.
         {"draw stride=20 off=240 max=1 (240+20>256)", true,
          [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 1, e.buf256.p, 240, nullptr, 0); }},
         {"draw stride=20 off=220 max=2 (220+40>256)", true,

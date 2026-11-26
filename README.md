@@ -26,7 +26,7 @@
 
 The inherited architecture uses the shared x86-64 CPU instruction set, system API compatibility shims, and translation of RDNA 2 GPU programs to SPIR-V. The project focuses on measurable correctness, reproducible tests, and hardware compatibility rather than claims of playability.
 
-**Repository:** [dyoogo/Leonida](https://github.com/dyoogo/Leonida) (Alpha Port development fork). The branding in this README does not imply that repository names, executables, configuration variables or paths have already been renamed.
+Alpha Studio maintains this project at [dyoogo/Alpha-Port](https://github.com/dyoogo/Alpha-Port).
 
 > [!IMPORTANT]
 > This is an unofficial research project, not an official PC release, and it is not currently demonstrated to be playable. The repository does not distribute the game, proprietary executables, keys, assets or generated game shaders. Use only lawfully obtained files that you are authorized to analyze and execute. No protection or licensing bypass is part of the project scope.
@@ -104,7 +104,7 @@ The inherited build system is designed for local development with authorized inp
 **The easy way:**
 
 1. Install the prerequisites below.
-2. Download this project **with its submodule**: `git clone --recursive https://github.com/dyoogo/Leonida`. A
+2. Download this project **with its submodule**: `git clone --recursive https://github.com/dyoogo/Alpha-Port`. A
    "Download ZIP" from GitHub leaves out `third_party/rpf9-explorer`. The build fetches it if `git` is installed,
    and otherwise tells you what to do.
 3. Double-click **`Build.bat`**.
